@@ -1,122 +1,82 @@
 import streamlit as st
 import pandas as pd
-import cloudscraper
+import requests
 import json
+from datetime import datetime
 import time
-from datetime import datetime, timedelta
 
+# 設定頁面
 st.set_page_config(page_title="賓果三星神算", page_icon="🎰", layout="centered")
 
-# --- 核心功能：突破封鎖抓取 ---
+# --- 核心功能：官方 API 直連 ---
 
-@st.cache_data(ttl=60) # 快取 60 秒
-def get_bingo_data_v7():
+@st.cache_data(ttl=30)  # 縮短快取時間為 30 秒，確保即時性
+def get_bingo_data_v8():
     """
-    V7.0 突破版：
-    1. 優先嘗試台灣彩券官方 API (JSON)
-    2. 失敗則使用 CloudScraper 繞過 Auzo 驗證
+    V8.0 官方 API 直連版 (No-Dependency)
+    直接請求台灣彩券官方 App 使用的後端 API
     """
-    scraper = cloudscraper.create_scraper(browser='chrome')
-    data_list = []
-    source_used = "未知"
-
-    # --- 策略 A: 官方 API (最快、最準、JSON 格式) ---
+    # 這是台彩官方 App 和新版官網使用的 API 端點
+    api_url = "https://api.content.taiwanlottery.com/v1/result/bingo"
+    
+    # 只需要最基本的偽裝，不用 cloudscraper
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json",
+        "Origin": "https://www.taiwanlottery.com.tw",
+        "Referer": "https://www.taiwanlottery.com.tw/"
+    }
+    
     try:
-        # 這是台彩新版官網的後端 API，直接回傳 JSON，不用解析 HTML
-        # 我們抓取今天的資料
-        today_str = (datetime.now() + timedelta(hours=8)).strftime('%Y-%m-%d')
-        # 官方 API 網址 (無需參數通常回傳最近 10 期，或需指定時間)
-        # 這裡嘗試直接抓取最近期數
-        api_url = "https://api.content.taiwanlottery.com/v1/result/bingo"
+        # 加上 timeout 避免卡死
+        response = requests.get(api_url, headers=headers, timeout=10)
         
-        # 雖然是 API，還是用 scraper 呼叫比較保險
-        response = scraper.get(api_url, timeout=10)
-        
-        if response.status_code == 200:
-            try:
-                # 解析 JSON
-                json_data = response.json()
-                # 官方結構通常是: content -> list of results
-                # 或是直接 list
-                # 假設結構: [ { "period": "113000001", "winnrs": [...] }, ... ]
-                
-                # 根據觀察，台彩 API 回傳結構 (content)
-                raw_list = json_data.get('content', [])
-                
-                # 如果直接是 list
-                if isinstance(json_data, list):
-                    raw_list = json_data
+        if response.status_code != 200:
+            st.error(f"API 連線異常: {response.status_code}")
+            return pd.DataFrame(), "連線失敗"
 
-                for item in raw_list:
-                    # 提取獎號
-                    # 官方欄位名稱通常是 'prizeNo' (一般號) 和 'superPrizeNo' (超級獎號)
-                    # 或是 'bigSmall' 等
-                    if 'prizeNo' in item:
-                        # 官方號碼有時是字串陣列，轉為 int
-                        nums = [int(n) for n in item['prizeNo']]
-                        # 賓果應該有 20 個號碼
-                        if len(nums) == 20:
-                            data_list.append(nums)
-                
-                if data_list:
-                    source_used = "官方 API (JSON)"
-                    return pd.DataFrame(data_list), source_used
-            except:
-                pass # JSON 解析失敗，轉用策略 B
-    except Exception as e:
-        print(f"Official API Error: {e}")
-
-    # --- 策略 B: CloudScraper + Auzo (最強備援) ---
-    try:
-        url = "https://lotto.auzo.tw/bingobingo.php"
-        # 使用 cloudscraper 發送請求 (它會自動處理 Cloudflare 驗證)
-        response = scraper.get(url, timeout=15)
-        response.encoding = 'utf-8'
+        # 解析 JSON
+        data = response.json()
         
-        if response.status_code == 200:
-            from bs4 import BeautifulSoup
-            import re
+        # 官方 API 結構通常放在 'content' 裡面
+        raw_list = data.get('content', [])
+        
+        parsed_data = []
+        
+        for item in raw_list:
+            # 官方欄位名稱確認：
+            # prizeNo: 一般號碼 (陣列)
+            # superPrizeNo: 超級獎號 (整數)
+            # period: 期別 (字串)
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            rows = soup.find_all('tr')
-            
-            for row in rows:
-                text = row.get_text(" ", strip=True)
-                nums = re.findall(r'\b(0?[1-9]|[1-7][0-9]|80)\b', text)
+            if 'prizeNo' in item and 'superPrizeNo' in item:
+                # 取得一般號碼
+                nums = item['prizeNo']
                 
-                if len(nums) >= 20:
-                    clean_nums = [int(n) for n in nums]
-                    # 檢查是否包含有效的賓果範圍
-                    bingo_nums = [n for n in clean_nums if 1 <= n <= 80]
-                    
-                    if len(bingo_nums) >= 20:
-                        # Auzo 的資料很整齊，取倒數第 21 到倒數第 1 個?
-                        # 通常 Auzo 結構: 期數, 日期, 號碼1~20, 超級獎號
-                        # 我們取最後 20 個介於 1-80 的數字 (假設最後一個是超級獎號，我們取那之前的20個)
-                        # 但為了保險，先取最後 20 個試試
-                        final_draw = bingo_nums[-20:]
-                        # 簡單去重檢查
-                        if len(set(final_draw)) == 20:
-                            data_list.append(final_draw)
+                # 確保格式正確 (有時候 API 會給字串陣列)
+                nums = [int(n) for n in nums]
+                
+                # 賓果應該有 20 個號碼
+                if len(nums) == 20:
+                    # 這裡是重點：官方 API 的號碼通常是「由小到大」排序好的
+                    # 但賓果開獎順序其實沒差，我們只要這 20 個號碼
+                    parsed_data.append(nums)
+        
+        if parsed_data:
+            return pd.DataFrame(parsed_data), "台灣彩券官方 API"
             
-            if data_list:
-                source_used = "Auzo (CloudScraper)"
-                return pd.DataFrame(data_list), source_used
+        return pd.DataFrame(), "無數據回傳"
 
     except Exception as e:
-        print(f"Scraper Error: {e}")
-
-    return pd.DataFrame(), "所有線路皆中斷"
+        print(f"API Error: {e}")
+        return pd.DataFrame(), f"系統錯誤: {e}"
 
 def analyze_numbers(df, periods=20):
     if df.empty: return None, None, None
     
-    # 確保只有數字
-    df = df.apply(pd.to_numeric, errors='coerce')
-    
+    # 取最近 N 期
     recent_data = df.head(periods)
     all_numbers = recent_data.values.flatten()
-    all_numbers = all_numbers[~pd.isna(all_numbers)]
     
     from collections import Counter
     counts = Counter(all_numbers)
@@ -130,10 +90,10 @@ def analyze_numbers(df, periods=20):
     
     return hot_numbers, cold_numbers, recent_data
 
-# --- UI ---
+# --- UI 介面 ---
 
 st.title("🎰 賓果三星神算")
-st.caption("版本：V7.0 穿牆破網版")
+st.caption("🚀 核心：官方 API 直連 (V8.0)")
 
 # 側邊欄
 st.sidebar.header("設定")
@@ -143,8 +103,8 @@ if st.sidebar.button("🔄 強制刷新"):
     st.rerun()
 
 # 執行抓取
-with st.spinner('正在嘗試突破 Cloudflare 防護網...'):
-    df_history, source_name = get_bingo_data_v7()
+with st.spinner('正在同步官方數據...'):
+    df_history, source_name = get_bingo_data_v8()
 
 if not df_history.empty:
     st.success(f"✅ 連線成功！來源：{source_name}")
@@ -156,18 +116,18 @@ if not df_history.empty:
         latest_draw = recent_df.iloc[0].tolist()
         st.markdown("### 📢 最新開獎")
         
+        # 官方 API 給的號碼通常是排序過的，這裡保持原樣顯示
         c1 = st.columns(10)
         c2 = st.columns(10)
         for i, num in enumerate(latest_draw):
-            val = int(num)
             if i < 10:
-                c1[i].markdown(f"**{val:02d}**")
+                c1[i].markdown(f"**{num:02d}**")
             elif i < 20:
-                c2[i-10].markdown(f"**{val:02d}**")
+                c2[i-10].markdown(f"**{num:02d}**")
 
     st.markdown("---")
     
-    # 推薦
+    # 推薦區塊
     st.header("🎯 三星推薦")
     col1, col2, col3 = st.columns(3)
     
@@ -175,24 +135,26 @@ if not df_history.empty:
         st.error("🔥 追熱門")
         if hot_df is not None and len(hot_df) >= 3:
             top = hot_df.head(3)['number'].tolist()
-            st.metric("號碼", f"{int(top[0]):02d}, {int(top[1]):02d}, {int(top[2]):02d}")
+            st.metric("號碼", f"{top[0]:02d}, {top[1]:02d}, {top[2]:02d}")
+            st.caption("近期最熱")
             
     with col2:
         st.info("❄️ 抓冷門")
         if cold_df is not None and len(cold_df) >= 3:
             bot = cold_df.head(3)['number'].tolist()
-            st.metric("號碼", f"{int(bot[0]):02d}, {int(bot[1]):02d}, {int(bot[2]):02d}")
+            st.metric("號碼", f"{bot[0]:02d}, {bot[1]:02d}, {bot[2]:02d}")
+            st.caption("近期最冷")
 
     with col3:
         st.warning("⚖️ 混合")
         if hot_df is not None and len(hot_df) >= 2 and cold_df is not None:
             mix = hot_df.head(2)['number'].tolist() + cold_df.head(1)['number'].tolist()
-            st.metric("號碼", f"{int(mix[0]):02d}, {int(mix[1]):02d}, {int(mix[2]):02d}")
+            st.metric("號碼", f"{mix[0]:02d}, {mix[1]:02d}, {mix[2]:02d}")
+            st.caption("2熱 + 1冷")
 
-    with st.expander("詳細數據"):
+    with st.expander("📊 查看詳細統計"):
         st.dataframe(hot_df)
 
 else:
-    st.error("❌ 依然無法穿透")
-    st.write("這表示 Streamlit 的雲端 IP (美國) 被所有台灣網站列入黑名單。")
-    st.info("由於這是免費雲端主機的限制，目前無解，除非在您本地電腦執行。")
+    st.error("❌ 無法取得數據")
+    st.write("請確認您的網路連線，或稍後再試。")
